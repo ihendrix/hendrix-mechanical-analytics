@@ -61,6 +61,7 @@ class TestData:
     stress_unit: str
     warnings: list[str]
     status: str
+    data_kind: str
 
 
 def metric_card(label, value, sub=""):
@@ -120,15 +121,101 @@ def example_data() -> dict[str, pd.DataFrame]:
     return output
 
 
+def _clean_header_value(value, index):
+    """Return a stable column name, including for blank Bluehill index columns."""
+    if pd.isna(value):
+        return "Specimen" if index == 0 else f"Column {index + 1}"
+
+    name = str(value).strip()
+
+    if not name or name.lower().startswith("unnamed"):
+        return "Specimen" if index == 0 else f"Column {index + 1}"
+
+    return name
+
+
+def _make_unique_columns(values):
+    output = []
+    counts = {}
+
+    for i, value in enumerate(values):
+        base = _clean_header_value(value, i)
+        counts[base] = counts.get(base, 0) + 1
+        output.append(base if counts[base] == 1 else f"{base} ({counts[base]})")
+
+    return output
+
+
+def _find_header_row(raw: pd.DataFrame, max_rows=30):
+    """Find the row containing the real mechanical-data headers."""
+    terms = [
+        "strain",
+        "stress",
+        "load",
+        "extension",
+        "displacement",
+        "time measurement",
+        "specimen",
+    ]
+
+    best_index = 0
+    best_score = -1
+
+    for index in range(min(max_rows, len(raw))):
+        row_text = " | ".join(
+            str(value).strip().lower()
+            for value in raw.iloc[index].tolist()
+            if not pd.isna(value)
+        )
+
+        score = sum(term in row_text for term in terms)
+
+        # A row containing both strain and stress is almost certainly the header.
+        if "strain" in row_text and "stress" in row_text:
+            score += 10
+
+        if score > best_score:
+            best_index = index
+            best_score = score
+
+    return best_index if best_score > 0 else 0
+
+
+def _promote_detected_header(raw: pd.DataFrame) -> pd.DataFrame:
+    raw = raw.dropna(axis=0, how="all").dropna(axis=1, how="all").reset_index(drop=True)
+
+    if raw.empty:
+        return raw
+
+    header_index = _find_header_row(raw)
+    columns = _make_unique_columns(raw.iloc[header_index].tolist())
+
+    df = raw.iloc[header_index + 1 :].copy().reset_index(drop=True)
+    df.columns = columns
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
+    return df.reset_index(drop=True)
+
+
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
     suffix = Path(uploaded_file.name).suffix.lower()
     data = uploaded_file.getvalue()
 
+    # Read without assuming that the first row is the header. Instron/Bluehill
+    # exports often place a title row above the actual column names.
     if suffix in [".xlsx", ".xls"]:
-        return pd.read_excel(io.BytesIO(data))
+        raw = pd.read_excel(io.BytesIO(data), header=None)
+    else:
+        sep = "	" if suffix == ".tsv" else None
+        raw = pd.read_csv(
+            io.BytesIO(data),
+            header=None,
+            sep=sep,
+            engine="python",
+            dtype=object,
+        )
 
-    sep = "\t" if suffix == ".tsv" else None
-    return pd.read_csv(io.BytesIO(data), sep=sep, engine="python")
+    return _promote_detected_header(raw)
 
 
 def extract_unit_row(df: pd.DataFrame):
@@ -287,13 +374,18 @@ def detect_failure(clean):
 
     flags = []
     status = "Valid"
-    failure_idx = peak_idx
+    failure_idx = None
 
+    # Only crop when a real post-peak drop is found. Previously this defaulted
+    # to peak_idx, which cropped every curve at its maximum even without failure.
     if peak_idx < len(stress) - 3 and peak_stress > 0:
         post = stress[peak_idx:]
         below = np.where(post <= 0.80 * peak_stress)[0]
+
         if len(below):
-            failure_idx = peak_idx + int(below[0])
+            candidate = peak_idx + int(below[0])
+            if candidate > peak_idx:
+                failure_idx = candidate
 
     early_end = max(8, int(len(stress) * 0.25))
     early = stress[:early_end]
@@ -308,8 +400,10 @@ def detect_failure(clean):
         status = "Noisy curve" if status == "Valid" else status
         flags.append("Peak stress occurred unusually early in the strain range.")
 
-    if peak_stress > 0 and final_stress < 0.70 * peak_stress:
-        flags.append("Post-peak stress drop detected and cropped if enabled.")
+    if failure_idx is not None:
+        flags.append("Confirmed post-peak stress drop detected and cropped if enabled.")
+    elif peak_stress > 0 and final_stress < 0.70 * peak_stress:
+        flags.append("Post-peak decrease detected, but no stable crop point was found.")
 
     return failure_idx, status, flags
 
@@ -342,7 +436,7 @@ def validate_modulus(window):
     return float(slope), float(r2), status
 
 
-def calculate_metrics(clean, modulus_min, modulus_max):
+def calculate_metrics(clean, modulus_min, modulus_max, data_kind="curve"):
     if clean.empty:
         return {
             "Peak Stress (MPa)": np.nan,
@@ -355,6 +449,20 @@ def calculate_metrics(clean, modulus_min, modulus_max):
         }
 
     peak_idx = int(clean["Stress_MPa"].idxmax())
+
+    # Results-table CSVs contain one peak point per specimen, not a continuous
+    # curve. Reporting a fitted modulus or AUC from those points would be false.
+    if data_kind == "summary":
+        return {
+            "Peak Stress (MPa)": float(clean.loc[peak_idx, "Stress_MPa"]),
+            "Strain at Peak": float(clean.loc[peak_idx, "Strain"]),
+            "Young's Modulus (MPa)": np.nan,
+            "Modulus R²": np.nan,
+            "Modulus Fit": "Peak summary points",
+            "Area Under Curve": np.nan,
+            "Rows": int(len(clean)),
+        }
+
     window = clean[(clean["Strain"] >= modulus_min) & (clean["Strain"] <= modulus_max)].copy()
 
     modulus, r2, fit_status = validate_modulus(window)
@@ -371,61 +479,131 @@ def calculate_metrics(clean, modulus_min, modulus_max):
     }
 
 
+def _is_peak_summary(strain_col, stress_col):
+    combined = f"{strain_col} {stress_col}".lower()
+    return "maximum load" in combined or "at maximum" in combined
+
+
+def _prepare_peak_summary(name, df, strain_col, stress_col, units):
+    unit = unit_from_column_or_row(stress_col, units)
+
+    strain = pd.to_numeric(df[strain_col], errors="coerce")
+    stress = convert_to_mpa(df[stress_col], unit)
+
+    label_col = next(
+        (col for col in df.columns if col not in {strain_col, stress_col}),
+        None,
+    )
+
+    if label_col is not None:
+        labels = df[label_col].astype(str).str.strip()
+    else:
+        labels = pd.Series([str(i + 1) for i in range(len(df))], index=df.index)
+
+    excluded = labels.str.contains(
+        r"mean|standard deviation|std\.?|results table",
+        case=False,
+        regex=True,
+        na=False,
+    )
+
+    clean = pd.DataFrame(
+        {
+            "Strain": strain,
+            "Stress_Raw_MPa": stress,
+            "Point_Label": labels,
+        }
+    )
+
+    clean = clean[~excluded].replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["Strain", "Stress_Raw_MPa"]
+    )
+    clean = clean[clean["Strain"] >= 0].reset_index(drop=True)
+
+    clean["Stress_Corrected_MPa"] = clean["Stress_Raw_MPa"]
+    clean["Stress_MPa"] = clean["Stress_Raw_MPa"]
+    clean["Specimen"] = name
+    clean["Data_Type"] = "summary"
+
+    notes = [
+        "Parsed as a peak-property results table; plotted as markers rather than a continuous curve.",
+        "Mean and standard-deviation rows were excluded from the graph.",
+    ]
+
+    return clean, unit, notes
+
+
 def prepare_test(name, df, smoothing, smooth_window, remove_outliers, crop_failure):
     df, units = extract_unit_row(df)
 
-    df = df.loc[:, ~pd.Series(df.columns).astype(str).str.contains("^Unnamed", regex=True).to_numpy()]
+    # Header detection already removes empty columns. Do not delete every
+    # 'Unnamed' column: Bluehill commonly uses a blank first header for specimen IDs.
+    df = df.dropna(axis=1, how="all").copy()
     df.columns = [str(c).strip() for c in df.columns]
 
     columns = list(df.columns)
 
     strain_col = guess_column(
         columns,
-        ["composite strain", "strain", "mm/mm", "tensile strain"],
-        ["stress", "load"],
+        ["composite strain", "tensile strain", "strain", "mm/mm"],
+        ["stress"],
     )
 
     stress_col = guess_column(
         columns,
         ["tensile stress", "stress", "mpa", "kpa"],
-        ["strain", "load"],
+        ["strain"],
     )
 
     numeric_cols = [
         c for c in columns
-        if pd.to_numeric(df[c], errors="coerce").notna().sum() >= 8
+        if pd.to_numeric(df[c], errors="coerce").notna().sum() >= 3
     ]
 
     if strain_col is None and numeric_cols:
         strain_col = numeric_cols[0]
 
-    if stress_col is None and len(numeric_cols) > 1:
-        stress_col = numeric_cols[1]
+    if stress_col is None:
+        stress_col = next((c for c in numeric_cols if c != strain_col), None)
 
     warnings = []
     unit = "MPa"
     clean = pd.DataFrame()
     status = "Insufficient fit region"
+    data_kind = "curve"
 
     if strain_col and stress_col:
-        clean, unit, warnings = clean_curve(
-            df,
-            strain_col,
-            stress_col,
-            units,
-            smoothing,
-            smooth_window,
-            remove_outliers,
-        )
+        if _is_peak_summary(strain_col, stress_col):
+            clean, unit, warnings = _prepare_peak_summary(
+                name,
+                df,
+                strain_col,
+                stress_col,
+                units,
+            )
+            status = "Summary points"
+            data_kind = "summary"
+        else:
+            clean, unit, warnings = clean_curve(
+                df,
+                strain_col,
+                stress_col,
+                units,
+                smoothing,
+                smooth_window,
+                remove_outliers,
+            )
 
-        failure_idx, status, failure_notes = detect_failure(clean)
-        warnings.extend(failure_notes)
+            failure_idx, status, failure_notes = detect_failure(clean)
+            warnings.extend(failure_notes)
 
-        if crop_failure and failure_idx is not None and failure_idx > 5:
-            clean = clean.iloc[:failure_idx + 1].copy()
-            warnings.append("Curve cropped at detected failure point.")
+            if crop_failure and failure_idx is not None and failure_idx > 5:
+                clean = clean.iloc[:failure_idx + 1].copy()
+                warnings.append("Curve cropped at confirmed failure point.")
 
-        clean["Specimen"] = name
+            clean["Specimen"] = name
+            clean["Point_Label"] = ""
+            clean["Data_Type"] = "curve"
 
     else:
         warnings.append("Could not detect strain and stress columns.")
@@ -439,6 +617,7 @@ def prepare_test(name, df, smoothing, smooth_window, remove_outliers, crop_failu
         stress_unit=unit,
         warnings=warnings,
         status=status,
+        data_kind=data_kind,
     )
 
 
@@ -446,7 +625,9 @@ def make_plot(data, raw_data, show_raw):
     fig = go.Figure()
 
     if show_raw and raw_data is not None and not raw_data.empty:
-        for name, g in raw_data.groupby("Specimen"):
+        raw_curves = raw_data[raw_data.get("Data_Type", "curve") == "curve"]
+
+        for name, g in raw_curves.groupby("Specimen"):
             fig.add_trace(
                 go.Scatter(
                     x=g["Strain"],
@@ -466,21 +647,43 @@ def make_plot(data, raw_data, show_raw):
             )
 
     for name, g in data.groupby("Specimen"):
-        fig.add_trace(
-            go.Scatter(
-                x=g["Strain"],
-                y=g["Stress_MPa"],
-                mode="lines",
-                name=name,
-                line=dict(width=3),
-                hovertemplate=(
-                    "<b>%{fullData.name}</b><br>"
-                    "Strain: %{x:.5f}<br>"
-                    "Stress: %{y:.5f} MPa"
-                    "<extra></extra>"
-                ),
+        data_type = g["Data_Type"].iloc[0] if "Data_Type" in g.columns else "curve"
+
+        if data_type == "summary":
+            labels = g["Point_Label"] if "Point_Label" in g.columns else None
+            fig.add_trace(
+                go.Scatter(
+                    x=g["Strain"],
+                    y=g["Stress_MPa"],
+                    mode="markers",
+                    name=f"{name} peak points",
+                    text=labels,
+                    marker=dict(size=11, line=dict(width=1)),
+                    hovertemplate=(
+                        "<b>%{fullData.name}</b><br>"
+                        "Specimen: %{text}<br>"
+                        "Strain at max load: %{x:.5f}<br>"
+                        "Stress at max load: %{y:.5f} MPa"
+                        "<extra></extra>"
+                    ),
+                )
             )
-        )
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=g["Strain"],
+                    y=g["Stress_MPa"],
+                    mode="lines",
+                    name=name,
+                    line=dict(width=3),
+                    hovertemplate=(
+                        "<b>%{fullData.name}</b><br>"
+                        "Strain: %{x:.5f}<br>"
+                        "Stress: %{y:.5f} MPa"
+                        "<extra></extra>"
+                    ),
+                )
+            )
 
     fig.update_layout(
         template="plotly_dark",
@@ -488,7 +691,7 @@ def make_plot(data, raw_data, show_raw):
         paper_bgcolor="#080a0f",
         plot_bgcolor="#080a0f",
         font=dict(color="#f5f3ee"),
-        title="Cleaned Stress–Strain Curves",
+        title="Stress–Strain Curves and Peak Summary Points",
         xaxis_title="Strain (mm/mm)",
         yaxis_title="Stress (MPa)",
         legend_title="Uploaded File",
@@ -651,12 +854,13 @@ raw_overlay = all_clean.copy()
 metrics = []
 
 for t in selected_tests:
-    m = calculate_metrics(t.clean, modulus_min, modulus_max)
+    m = calculate_metrics(t.clean, modulus_min, modulus_max, t.data_kind)
     m.update(
         {
             "File": t.name,
             "Detected Strain Column": t.strain_col,
             "Detected Stress Column": t.stress_col,
+            "Data Type": t.data_kind.title(),
         }
     )
     metrics.append(m)
