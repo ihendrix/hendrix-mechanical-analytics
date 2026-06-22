@@ -4,10 +4,12 @@ Interactive Streamlit application for analyzing stress-strain experiments, extra
 
 The app allows users to upload mechanical-testing files, clean noisy stress-strain data, estimate Young's modulus, review curve-quality warnings, and export processed results directly from a web browser.
 
-# Live Application
+## Live Application
 
-[Open Hendrix Mechanical Analytics
-]([url](https://hendrix-mechanical-analytics.streamlit.app/))
+[Open Hendrix Mechanical Analytics](https://hendrix-mechanical-analytics.streamlit.app)
+
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://hendrix-mechanical-analytics.streamlit.app)
+
 
 ## Features
 
