@@ -6,7 +6,8 @@ The app allows users to upload mechanical-testing files, clean noisy stress-stra
 
 # Live Application
 
-[Open Hendrix Mechanical Analytics ]([url](https://hendrix-mechanical-analytics.streamlit.app/))
+[Open Hendrix Mechanical Analytics
+]([url](https://hendrix-mechanical-analytics.streamlit.app/))
 
 ## Features
 
