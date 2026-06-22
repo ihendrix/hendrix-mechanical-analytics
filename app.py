@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,6 +78,192 @@ def metric_card(label, value, sub=""):
         """,
         unsafe_allow_html=True,
     )
+
+
+LOCAL_AI_SYSTEM_PROMPT = """
+You are a cautious mechanical-testing analysis assistant embedded in a local
+stress-strain dashboard. Use only the supplied computed metrics, sampled curve
+points, parser diagnostics, and cleaning notes. Never invent missing values,
+material composition, causal mechanisms, ASTM compliance, or pass/fail claims.
+Treat summary-point files as discrete peak-property records, not continuous
+stress-strain curves. Clearly separate direct observations from possible
+interpretations. Highlight unit uncertainty, weak modulus fits, parsing issues,
+and limitations. Keep the response concise, technical, and useful to a
+researcher. This AI output supports review and does not replace final materials
+validation.
+""".strip()
+
+
+def normalize_ollama_url(url: str) -> str:
+    return (url or "http://localhost:11434").strip().rstrip("/")
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def list_ollama_models(base_url: str):
+    """Return locally available Ollama model names and a readable error."""
+    base_url = normalize_ollama_url(base_url)
+    request = urllib.request.Request(
+        f"{base_url}/api/tags",
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=1.5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        models = sorted(
+            model.get("name", "")
+            for model in payload.get("models", [])
+            if model.get("name")
+        )
+        return models, ""
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        return [], f"Could not reach Ollama at {base_url}: {reason}"
+    except Exception as exc:
+        return [], f"Could not read the Ollama model list: {exc}"
+
+
+def ollama_chat(base_url: str, model: str, messages: list[dict], timeout=240) -> str:
+    """Send a non-streaming chat request to a local Ollama server."""
+    base_url = normalize_ollama_url(base_url)
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": 0.15,
+            "num_ctx": 8192,
+        },
+        "keep_alive": "10m",
+    }
+
+    request = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(detail).get("error", detail)
+        except Exception:
+            pass
+        raise RuntimeError(f"Ollama returned HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise RuntimeError(
+            f"Could not connect to Ollama at {base_url}. Start Ollama and confirm the model is installed. Details: {reason}"
+        ) from exc
+
+    content = result.get("message", {}).get("content", "").strip()
+    if not content:
+        raise RuntimeError("Ollama returned an empty response.")
+    return content
+
+
+def _rounded_or_none(value, digits=6):
+    if value is None or pd.isna(value):
+        return None
+    return round(float(value), digits)
+
+
+def build_local_ai_context(metrics_df, selected_tests, settings):
+    """Build a compact, auditable context instead of sending every raw row."""
+    metric_records = []
+
+    for _, row in metrics_df.iterrows():
+        metric_records.append(
+            {
+                "file": row.get("File"),
+                "data_type": row.get("Data Type"),
+                "peak_stress_mpa": _rounded_or_none(row.get("Peak Stress (MPa)")),
+                "strain_at_peak": _rounded_or_none(row.get("Strain at Peak")),
+                "youngs_modulus_mpa": _rounded_or_none(row.get("Young's Modulus (MPa)")),
+                "modulus_r2": _rounded_or_none(row.get("Modulus R²")),
+                "modulus_fit": row.get("Modulus Fit"),
+                "area_under_curve": _rounded_or_none(row.get("Area Under Curve")),
+                "rows": int(row.get("Rows", 0)),
+                "detected_strain_column": row.get("Detected Strain Column"),
+                "detected_stress_column": row.get("Detected Stress Column"),
+            }
+        )
+
+    file_details = []
+
+    for test in selected_tests:
+        clean = test.clean.reset_index(drop=True)
+        detail = {
+            "file": test.name,
+            "data_kind": test.data_kind,
+            "status": test.status,
+            "source_stress_unit": test.stress_unit,
+            "warnings_and_cleaning_notes": test.warnings[:12],
+        }
+
+        if not clean.empty:
+            detail.update(
+                {
+                    "row_count": int(len(clean)),
+                    "strain_min": _rounded_or_none(clean["Strain"].min()),
+                    "strain_max": _rounded_or_none(clean["Strain"].max()),
+                    "stress_min_mpa": _rounded_or_none(clean["Stress_MPa"].min()),
+                    "stress_max_mpa": _rounded_or_none(clean["Stress_MPa"].max()),
+                    "final_stress_mpa": _rounded_or_none(clean["Stress_MPa"].iloc[-1]),
+                }
+            )
+
+            if test.data_kind == "summary":
+                sample = clean.head(30)
+            else:
+                sample_count = min(16, len(clean))
+                positions = np.linspace(0, len(clean) - 1, sample_count, dtype=int)
+                sample = clean.iloc[np.unique(positions)]
+
+            detail["representative_points"] = [
+                {
+                    "label": str(row.get("Point_Label", "")).strip() or None,
+                    "strain": _rounded_or_none(row["Strain"]),
+                    "stress_mpa": _rounded_or_none(row["Stress_MPa"]),
+                }
+                for _, row in sample.iterrows()
+            ]
+
+        file_details.append(detail)
+
+    context = {
+        "dashboard_settings": settings,
+        "computed_metric_summary": metric_records,
+        "file_diagnostics_and_sampled_points": file_details,
+        "important_constraints": [
+            "Representative points are downsampled for AI context; calculations use the full cleaned data.",
+            "A summary file contains independent peak-property points and must not be interpreted as a continuous curve.",
+            "Missing values are unavailable, not zero.",
+        ],
+    }
+
+    return json.dumps(context, indent=2, allow_nan=False)
+
+
+def run_local_ai_review(base_url, model, context, user_request):
+    messages = [
+        {"role": "system", "content": LOCAL_AI_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"{user_request}\n\n"
+                "Analyze the following dashboard context:\n"
+                f"```json\n{context}\n```"
+            ),
+        },
+    ]
+    return ollama_chat(base_url, model, messages)
 
 
 def safe_name(filename: str) -> str:
@@ -764,6 +953,39 @@ with st.sidebar:
         format="%.4f",
     )
 
+    st.divider()
+    st.caption("Local AI")
+
+    ollama_url = st.text_input(
+        "Ollama server",
+        value="http://localhost:11434",
+        help="Keep this on localhost to run the model on this computer.",
+    )
+
+    installed_models, ollama_connection_error = list_ollama_models(ollama_url)
+
+    if installed_models:
+        preferred_model = next(
+            (name for name in installed_models if name.startswith("qwen3.5:4b")),
+            installed_models[0],
+        )
+        ai_model = st.selectbox(
+            "Local model",
+            options=installed_models,
+            index=installed_models.index(preferred_model),
+        )
+        st.success(f"Ollama connected · {len(installed_models)} model(s)")
+    else:
+        ai_model = st.text_input("Local model", value="qwen3.5:4b")
+        st.caption("Ollama is not connected yet. The analysis dashboard still works normally.")
+
+    if st.button("Refresh local models", use_container_width=True):
+        list_ollama_models.clear()
+        st.rerun()
+
+    if "cloud" in ai_model.lower():
+        st.warning("This model name appears to use Ollama Cloud, so it is not fully local.")
+
 
 st.markdown(
     f'<div class="hero-title">{APP_NAME}</div>'
@@ -955,6 +1177,103 @@ if not metrics_df.empty:
     bar.update_yaxes(gridcolor="rgba(255,255,255,.07)")
 
     st.plotly_chart(bar, use_container_width=True)
+
+
+st.markdown('<div class="section-title">Local AI Review</div>', unsafe_allow_html=True)
+
+st.caption(
+    "The app sends a compact metric summary, diagnostics, and representative curve points "
+    "to the configured Ollama server. With localhost and a non-cloud model, processing stays on this computer."
+)
+
+ai_context = build_local_ai_context(
+    metrics_df,
+    selected_tests,
+    {
+        "smoothing": smoothing,
+        "smoothing_window": smooth_window,
+        "remove_spike_outliers": remove_outliers,
+        "crop_after_confirmed_failure": crop_failure,
+        "modulus_fit_start_strain": modulus_min,
+        "modulus_fit_end_strain": modulus_max,
+    },
+)
+
+review_tab, question_tab = st.tabs(["Automatic review", "Ask the data"])
+
+with review_tab:
+    st.write(
+        "Generate a file-by-file review of material-property results, fit quality, anomalies, and next checks."
+    )
+
+    review_disabled = not bool(selected_tests) or not bool(ai_model.strip())
+
+    if st.button(
+        "Generate local AI review",
+        type="primary",
+        use_container_width=True,
+        disabled=review_disabled,
+    ):
+        try:
+            with st.spinner(f"Running {ai_model} locally..."):
+                st.session_state.local_ai_review = run_local_ai_review(
+                    ollama_url,
+                    ai_model,
+                    ai_context,
+                    """
+Review these selected mechanical-test files. Return:
+1. A three-bullet executive summary.
+2. File-by-file findings using the supplied values and units.
+3. Data-quality or modulus-fit concerns.
+4. Supported comparisons between files.
+5. Specific next checks before the results are used in a report.
+Do not repeat the raw JSON.
+""".strip(),
+                )
+        except Exception as exc:
+            st.error(str(exc))
+
+    if st.session_state.get("local_ai_review"):
+        st.markdown(st.session_state.local_ai_review)
+
+with question_tab:
+    ai_question = st.text_area(
+        "Question",
+        placeholder=(
+            "Examples: Which file has the strongest supported result? "
+            "Why is the modulus fit weak? What should I inspect next?"
+        ),
+        height=100,
+    )
+
+    if st.button(
+        "Ask local AI",
+        use_container_width=True,
+        disabled=not bool(ai_question.strip()) or not bool(selected_tests),
+    ):
+        try:
+            with st.spinner(f"Asking {ai_model} locally..."):
+                answer = run_local_ai_review(
+                    ollama_url,
+                    ai_model,
+                    ai_context,
+                    (
+                        "Answer the researcher's question using only the supplied dashboard context. "
+                        "Quote the relevant numeric evidence and state limitations.\n\n"
+                        f"Question: {ai_question.strip()}"
+                    ),
+                )
+
+            history = st.session_state.setdefault("local_ai_history", [])
+            history.append({"question": ai_question.strip(), "answer": answer})
+            st.session_state.local_ai_history = history[-6:]
+        except Exception as exc:
+            st.error(str(exc))
+
+    for item in reversed(st.session_state.get("local_ai_history", [])):
+        with st.container(border=True):
+            st.markdown(f"**Question:** {item['question']}")
+            st.markdown(item["answer"])
 
 
 with st.expander("Cleaning notes", expanded=False):
