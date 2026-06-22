@@ -4,6 +4,10 @@ Interactive Streamlit application for analyzing stress-strain experiments, extra
 
 The app allows users to upload mechanical-testing files, clean noisy stress-strain data, estimate Young's modulus, review curve-quality warnings, and export processed results directly from a web browser.
 
+# Live Application
+
+[Open Hendrix Mechanical Analytics ]([url](https://hendrix-mechanical-analytics.streamlit.app/))
+
 ## Features
 
 - Upload CSV, Excel, TXT, DAT, or TSV files
@@ -19,21 +23,6 @@ The app allows users to upload mechanical-testing files, clean noisy stress-stra
 - Download cleaned CSV, summary CSV, and interactive chart HTML
 - Use included demonstration data when no file is uploaded
 
-## Run locally
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Deploy on Streamlit Community Cloud
-
-1. Upload `app.py`, `requirements.txt`, and `README.md` to a GitHub repository.
-2. Sign in to Streamlit Community Cloud with GitHub.
-3. Select the repository and set the entrypoint file to `app.py`.
-4. Deploy the app.
-5. Share the resulting `streamlit.app` URL.
-
 ## Public-safety note
 
-Only upload data that is approved for external use. Use generic file names and synthetic or public example data for demonstrations. Do not include proprietary sample labels, internal organization names, confidential metadata, or restricted instrument exports.
+Only upload data that is approved for external use.
