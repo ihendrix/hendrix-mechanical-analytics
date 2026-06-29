@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import csv
 import io
-import json
 import re
-import urllib.error
-import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,199 +79,12 @@ def metric_card(label, value, sub=""):
     )
 
 
-LOCAL_AI_SYSTEM_PROMPT = """
-You are a cautious mechanical-testing analysis assistant embedded in a local
-stress-strain dashboard. Use only the supplied computed metrics, sampled curve
-points, parser diagnostics, and cleaning notes. Never invent missing values,
-material composition, causal mechanisms, ASTM compliance, or pass/fail claims.
-Treat summary-point files as discrete peak-property records, not continuous
-stress-strain curves. Clearly separate direct observations from possible
-interpretations. Highlight unit uncertainty, weak modulus fits, parsing issues,
-and limitations. Keep the response concise, technical, and useful to a
-researcher. This AI output supports review and does not replace final materials
-validation.
-""".strip()
-
-
-def normalize_ollama_url(url: str) -> str:
-    return (url or "http://localhost:11434").strip().rstrip("/")
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def list_ollama_models(base_url: str):
-    """Return locally available Ollama model names and a readable error."""
-    base_url = normalize_ollama_url(base_url)
-    request = urllib.request.Request(
-        f"{base_url}/api/tags",
-        headers={"Accept": "application/json"},
-        method="GET",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=1.5) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        models = sorted(
-            model.get("name", "")
-            for model in payload.get("models", [])
-            if model.get("name")
-        )
-        return models, ""
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", exc)
-        return [], f"Could not reach Ollama at {base_url}: {reason}"
-    except Exception as exc:
-        return [], f"Could not read the Ollama model list: {exc}"
-
-
-def ollama_chat(base_url: str, model: str, messages: list[dict], timeout=240) -> str:
-    """Send a non-streaming chat request to a local Ollama server."""
-    base_url = normalize_ollama_url(base_url)
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "think": False,
-        "options": {
-            "temperature": 0.15,
-            "num_ctx": 8192,
-        },
-        "keep_alive": "10m",
-    }
-
-    request = urllib.request.Request(
-        f"{base_url}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        try:
-            detail = json.loads(detail).get("error", detail)
-        except Exception:
-            pass
-        raise RuntimeError(f"Ollama returned HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", exc)
-        raise RuntimeError(
-            f"Could not connect to Ollama at {base_url}. Start Ollama and confirm the model is installed. Details: {reason}"
-        ) from exc
-
-    content = result.get("message", {}).get("content", "").strip()
-    if not content:
-        raise RuntimeError("Ollama returned an empty response.")
-    return content
-
-
-def _rounded_or_none(value, digits=6):
-    if value is None or pd.isna(value):
-        return None
-    return round(float(value), digits)
-
-
-def build_local_ai_context(metrics_df, selected_tests, settings):
-    """Build a compact, auditable context instead of sending every raw row."""
-    metric_records = []
-
-    for _, row in metrics_df.iterrows():
-        metric_records.append(
-            {
-                "file": row.get("File"),
-                "sample": row.get("Sample"),
-                "repetition": _rounded_or_none(row.get("Repetition"), 0),
-                "data_type": row.get("Data Type"),
-                "peak_stress_mpa": _rounded_or_none(row.get("Peak Stress (MPa)")),
-                "strain_at_peak": _rounded_or_none(row.get("Strain at Peak")),
-                "youngs_modulus_mpa": _rounded_or_none(row.get("Young's Modulus (MPa)")),
-                "modulus_r2": _rounded_or_none(row.get("Modulus R²")),
-                "modulus_fit": row.get("Modulus Fit"),
-                "area_under_curve": _rounded_or_none(row.get("Area Under Curve")),
-                "rows": int(row.get("Rows", 0)),
-                "detected_strain_column": row.get("Detected Strain Column"),
-                "detected_stress_column": row.get("Detected Stress Column"),
-            }
-        )
-
-    file_details = []
-
-    for test in selected_tests:
-        clean = test.clean.reset_index(drop=True)
-        detail = {
-            "file": test.name,
-            "data_kind": test.data_kind,
-            "status": test.status,
-            "source_stress_unit": test.stress_unit,
-            "warnings_and_cleaning_notes": test.warnings[:12],
-        }
-
-        if not clean.empty:
-            detail.update(
-                {
-                    "row_count": int(len(clean)),
-                    "strain_min": _rounded_or_none(clean["Strain"].min()),
-                    "strain_max": _rounded_or_none(clean["Strain"].max()),
-                    "stress_min_mpa": _rounded_or_none(clean["Stress_MPa"].min()),
-                    "stress_max_mpa": _rounded_or_none(clean["Stress_MPa"].max()),
-                    "final_stress_mpa": _rounded_or_none(clean["Stress_MPa"].iloc[-1]),
-                }
-            )
-
-            if test.data_kind == "summary":
-                sample = clean.head(30)
-            else:
-                sample_count = min(16, len(clean))
-                positions = np.linspace(0, len(clean) - 1, sample_count, dtype=int)
-                sample = clean.iloc[np.unique(positions)]
-
-            detail["representative_points"] = [
-                {
-                    "label": str(row.get("Point_Label", "")).strip() or None,
-                    "strain": _rounded_or_none(row["Strain"]),
-                    "stress_mpa": _rounded_or_none(row["Stress_MPa"]),
-                }
-                for _, row in sample.iterrows()
-            ]
-
-        file_details.append(detail)
-
-    context = {
-        "dashboard_settings": settings,
-        "computed_metric_summary": metric_records,
-        "file_diagnostics_and_sampled_points": file_details,
-        "important_constraints": [
-            "Representative points are downsampled for AI context; calculations use the full cleaned data.",
-            "A summary file contains independent peak-property points and must not be interpreted as a continuous curve.",
-            "Missing values are unavailable, not zero.",
-        ],
-    }
-
-    return json.dumps(context, indent=2, allow_nan=False)
-
-
-def run_local_ai_review(base_url, model, context, user_request):
-    messages = [
-        {"role": "system", "content": LOCAL_AI_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"{user_request}\n\n"
-                "Analyze the following dashboard context:\n"
-                f"```json\n{context}\n```"
-            ),
-        },
-    ]
-    return ollama_chat(base_url, model, messages)
-
-
 def safe_name(filename: str) -> str:
     name = Path(filename).stem
+    name = re.sub(r"\s*\(\d+\)$", "", name)
     name = name.replace("_corrected", "")
     name = name.replace("_", " ")
-    return name.strip()
+    return re.sub(r"\s+", " ", name).strip()
 
 
 def display_name_from_index(index: int) -> str:
@@ -282,41 +94,100 @@ def display_name_from_index(index: int) -> str:
 def parse_sample_repetition(name: str):
     """Split names like SampleX-1 / Sample X - 1 into sample and replicate."""
     base = Path(str(name)).stem.strip()
+    base = re.sub(r"\s*\(\d+\)$", "", base)
     base = re.sub(r"\s+", " ", base)
 
     match = re.match(r"^(.*?)[_\s-]+(-?\d+)$", base)
     if match:
         sample = match.group(1).strip(" _-") or base
-        rep = int(match.group(2))
-        return sample, rep
-
-    # Handles names where the final repetition is attached directly, e.g. X1.
-    match = re.match(r"^(.*?)(-\d+|\d+)$", base)
-    if match and len(match.group(1).strip()) >= 1:
-        sample = match.group(1).strip(" _-") or base
-        rep = int(match.group(2))
-        return sample, rep
+        return sample, int(match.group(2))
 
     return base, np.nan
 
 
-def summarize_by_sample(metrics_df: pd.DataFrame) -> pd.DataFrame:
-    """Average replicate files by parsed sample name and report standard deviations."""
-    if metrics_df.empty:
+def _format_repetition(value):
+    if pd.isna(value):
+        return ""
+    try:
+        number = float(value)
+        return str(int(number)) if number.is_integer() else str(number)
+    except Exception:
+        return str(value).strip()
+
+
+def build_replicate_records(
+    selected_tests: list[TestData],
+    metrics_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return one row per physical repetition for averages and standard deviations."""
+    records = []
+    metric_lookup = {
+        row["File"]: row
+        for _, row in metrics_df.iterrows()
+    }
+
+    for test in selected_tests:
+        sample_name, file_repetition = parse_sample_repetition(test.name)
+
+        if test.data_kind == "summary":
+            for _, row in test.clean.iterrows():
+                repetition = row.get("Point_Label", "")
+                records.append(
+                    {
+                        "File": test.name,
+                        "Sample": sample_name,
+                        "Repetition": repetition,
+                        "Maximum Load (N)": row.get("Maximum_Load_N", np.nan),
+                        "Peak Stress (MPa)": row.get("Stress_MPa", np.nan),
+                        "Strain at Peak": row.get("Strain", np.nan),
+                        "Young's Modulus (MPa)": row.get("Youngs_Modulus_MPa", np.nan),
+                        "Modulus R²": np.nan,
+                        "Area Under Curve": row.get("Area_Under_Curve", np.nan),
+                    }
+                )
+        else:
+            metric_row = metric_lookup.get(test.name)
+            if metric_row is None:
+                continue
+
+            records.append(
+                {
+                    "File": test.name,
+                    "Sample": sample_name,
+                    "Repetition": file_repetition,
+                    "Maximum Load (N)": metric_row.get("Maximum Load (N)", np.nan),
+                    "Peak Stress (MPa)": metric_row.get("Peak Stress (MPa)", np.nan),
+                    "Strain at Peak": metric_row.get("Strain at Peak", np.nan),
+                    "Young's Modulus (MPa)": metric_row.get("Young's Modulus (MPa)", np.nan),
+                    "Modulus R²": metric_row.get("Modulus R²", np.nan),
+                    "Area Under Curve": metric_row.get("Area Under Curve", np.nan),
+                }
+            )
+
+    return pd.DataFrame(records)
+
+
+def summarize_by_sample(replicate_records: pd.DataFrame) -> pd.DataFrame:
+    """Average repetition-level values by sample and report standard deviations."""
+    if replicate_records.empty:
         return pd.DataFrame()
 
-    df = metrics_df.copy()
-    parsed = df["File"].apply(parse_sample_repetition)
-    df["Sample"] = parsed.apply(lambda x: x[0])
-    df["Repetition"] = parsed.apply(lambda x: x[1])
-
+    df = replicate_records.copy()
     numeric_cols = [
-        "Peak Stress (MPa)",
-        "Strain at Peak",
-        "Young's Modulus (MPa)",
-        "Modulus R²",
-        "Area Under Curve",
+        col
+        for col in [
+            "Maximum Load (N)",
+            "Peak Stress (MPa)",
+            "Strain at Peak",
+            "Young's Modulus (MPa)",
+            "Modulus R²",
+            "Area Under Curve",
+        ]
+        if col in df.columns
     ]
+
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     grouped = df.groupby("Sample", dropna=False)
     summary = grouped[numeric_cols].agg(["mean", "std"])
@@ -324,10 +195,14 @@ def summarize_by_sample(metrics_df: pd.DataFrame) -> pd.DataFrame:
     summary = summary.reset_index()
 
     summary.insert(1, "Replicates", grouped.size().values)
-    rep_values = grouped["Repetition"].apply(
-        lambda s: ", ".join(str(int(v)) for v in sorted(s.dropna().unique()))
+    repetitions = grouped["Repetition"].apply(
+        lambda values: ", ".join(
+            value
+            for value in (_format_repetition(v) for v in values)
+            if value
+        )
     ).reset_index(drop=True)
-    summary.insert(2, "Repetitions", rep_values)
+    summary.insert(2, "Repetitions", repetitions)
 
     return summary
 
@@ -441,25 +316,92 @@ def _promote_detected_header(raw: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def read_uploaded_file(uploaded_file) -> pd.DataFrame:
-    suffix = Path(uploaded_file.name).suffix.lower()
-    data = uploaded_file.getvalue()
+SUPPORTED_FILE_EXTENSIONS = {".csv", ".xlsx", ".xls", ".txt", ".dat", ".tsv"}
 
-    # Read without assuming that the first row is the header. Instron/Bluehill
-    # exports often place a title row above the actual column names.
+
+def _decode_text(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _detect_delimiter(text: str, suffix: str) -> str:
+    if suffix == ".csv":
+        return ","
+    if suffix == ".tsv":
+        return "\t"
+
+    lines = [line for line in text.splitlines() if line.strip()][:30]
+    candidates = [",", "\t", ";", "|"]
+    scores = {
+        delimiter: sum(line.count(delimiter) for line in lines)
+        for delimiter in candidates
+    }
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else ","
+
+
+def _read_ragged_delimited(data: bytes, suffix: str) -> pd.DataFrame:
+    """Read Instron/Bluehill exports whose title and data rows have different widths."""
+    text = _decode_text(data)
+    delimiter = _detect_delimiter(text, suffix)
+
+    rows = []
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    for row in reader:
+        if row and any(str(cell).strip() for cell in row):
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    width = max(len(row) for row in rows)
+    padded = [row + [None] * (width - len(row)) for row in rows]
+    return pd.DataFrame(padded, dtype=object)
+
+
+def read_file_bytes(filename: str, data: bytes) -> pd.DataFrame:
+    suffix = Path(filename).suffix.lower()
+
     if suffix in [".xlsx", ".xls"]:
         raw = pd.read_excel(io.BytesIO(data), header=None)
     else:
-        sep = "	" if suffix == ".tsv" else None
-        raw = pd.read_csv(
-            io.BytesIO(data),
-            header=None,
-            sep=sep,
-            engine="python",
-            dtype=object,
-        )
+        raw = _read_ragged_delimited(data, suffix)
 
     return _promote_detected_header(raw)
+
+
+def read_uploaded_file(uploaded_file) -> pd.DataFrame:
+    return read_file_bytes(uploaded_file.name, uploaded_file.getvalue())
+
+
+def iter_uploaded_payloads(uploaded_files):
+    """Yield supported files, expanding ZIP archives used for folder uploads."""
+    for uploaded in uploaded_files:
+        suffix = Path(uploaded.name).suffix.lower()
+        data = uploaded.getvalue()
+
+        if suffix != ".zip":
+            yield uploaded.name, data
+            continue
+
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+
+                member_path = Path(member.filename)
+                member_suffix = member_path.suffix.lower()
+
+                if member_suffix not in SUPPORTED_FILE_EXTENSIONS:
+                    continue
+                if member_path.name.startswith(".") or "__MACOSX" in member.parts:
+                    continue
+
+                yield member_path.name, archive.read(member)
 
 
 def extract_unit_row(df: pd.DataFrame):
@@ -683,6 +625,7 @@ def validate_modulus(window):
 def calculate_metrics(clean, modulus_min, modulus_max, data_kind="curve"):
     if clean.empty:
         return {
+            "Maximum Load (N)": np.nan,
             "Peak Stress (MPa)": np.nan,
             "Strain at Peak": np.nan,
             "Young's Modulus (MPa)": np.nan,
@@ -692,27 +635,39 @@ def calculate_metrics(clean, modulus_min, modulus_max, data_kind="curve"):
             "Rows": 0,
         }
 
-    peak_idx = int(clean["Stress_MPa"].idxmax())
-
-    # Results-table CSVs contain one peak point per specimen, not a continuous
-    # curve. Reporting a fitted modulus or AUC from those points would be false.
     if data_kind == "summary":
+        modulus = pd.to_numeric(
+            clean.get("Youngs_Modulus_MPa", pd.Series(dtype=float)),
+            errors="coerce",
+        )
+        auc = pd.to_numeric(
+            clean.get("Area_Under_Curve", pd.Series(dtype=float)),
+            errors="coerce",
+        )
+        load = pd.to_numeric(
+            clean.get("Maximum_Load_N", pd.Series(dtype=float)),
+            errors="coerce",
+        )
+
         return {
-            "Peak Stress (MPa)": float(clean.loc[peak_idx, "Stress_MPa"]),
-            "Strain at Peak": float(clean.loc[peak_idx, "Strain"]),
-            "Young's Modulus (MPa)": np.nan,
+            "Maximum Load (N)": float(load.mean()) if load.notna().any() else np.nan,
+            "Peak Stress (MPa)": float(clean["Stress_MPa"].mean()),
+            "Strain at Peak": float(clean["Strain"].mean()),
+            "Young's Modulus (MPa)": float(modulus.mean()) if modulus.notna().any() else np.nan,
             "Modulus R²": np.nan,
-            "Modulus Fit": "Peak summary points",
-            "Area Under Curve": np.nan,
+            "Modulus Fit": "Automatic results-table values",
+            "Area Under Curve": float(auc.mean()) if auc.notna().any() else np.nan,
             "Rows": int(len(clean)),
         }
 
+    peak_idx = int(clean["Stress_MPa"].idxmax())
     window = clean[(clean["Strain"] >= modulus_min) & (clean["Strain"] <= modulus_max)].copy()
 
     modulus, r2, fit_status = validate_modulus(window)
     auc = float(np.trapezoid(clean["Stress_MPa"], clean["Strain"])) if len(clean) >= 2 else np.nan
 
     return {
+        "Maximum Load (N)": np.nan,
         "Peak Stress (MPa)": float(clean.loc[peak_idx, "Stress_MPa"]),
         "Strain at Peak": float(clean.loc[peak_idx, "Strain"]),
         "Young's Modulus (MPa)": modulus,
@@ -734,8 +689,28 @@ def _prepare_peak_summary(name, df, strain_col, stress_col, units):
     strain = pd.to_numeric(df[strain_col], errors="coerce")
     stress = convert_to_mpa(df[stress_col], unit)
 
+    modulus_col = guess_column(
+        df.columns,
+        ["automatic young", "young", "modulus"],
+        ["strain", "stress"],
+    )
+    auc_col = guess_column(
+        df.columns,
+        ["area under curve", "area", "energy"],
+        ["strain", "stress"],
+    )
+    load_col = guess_column(
+        df.columns,
+        ["maximum load", "max load", "load"],
+        ["strain", "stress"],
+    )
+
+    excluded_columns = {strain_col, stress_col}
+    excluded_columns.update(
+        col for col in [modulus_col, auc_col, load_col] if col is not None
+    )
     label_col = next(
-        (col for col in df.columns if col not in {strain_col, stress_col}),
+        (col for col in df.columns if col not in excluded_columns),
         None,
     )
 
@@ -751,11 +726,33 @@ def _prepare_peak_summary(name, df, strain_col, stress_col, units):
         na=False,
     )
 
+    modulus = (
+        convert_to_mpa(
+            df[modulus_col],
+            unit_from_column_or_row(modulus_col, units),
+        )
+        if modulus_col is not None
+        else pd.Series(np.nan, index=df.index)
+    )
+    auc = (
+        pd.to_numeric(df[auc_col], errors="coerce")
+        if auc_col is not None
+        else pd.Series(np.nan, index=df.index)
+    )
+    load = (
+        pd.to_numeric(df[load_col], errors="coerce")
+        if load_col is not None
+        else pd.Series(np.nan, index=df.index)
+    )
+
     clean = pd.DataFrame(
         {
             "Strain": strain,
             "Stress_Raw_MPa": stress,
             "Point_Label": labels,
+            "Maximum_Load_N": load,
+            "Youngs_Modulus_MPa": modulus,
+            "Area_Under_Curve": auc,
         }
     )
 
@@ -770,9 +767,16 @@ def _prepare_peak_summary(name, df, strain_col, stress_col, units):
     clean["Data_Type"] = "summary"
 
     notes = [
-        "Parsed as a peak-property results table; plotted as markers rather than a continuous curve.",
-        "Mean and standard-deviation rows were excluded from the graph.",
+        "Parsed as an Instron results table with one repetition per row.",
+        "Existing mean and standard-deviation rows were excluded and recalculated from repetition rows.",
     ]
+
+    if modulus_col is not None:
+        notes.append(f"Imported automatic Young's modulus from `{modulus_col}`.")
+    if auc_col is not None:
+        notes.append(f"Imported area-under-curve values from `{auc_col}`.")
+    if load_col is not None:
+        notes.append(f"Imported maximum-load values from `{load_col}`.")
 
     return clean, unit, notes
 
@@ -953,7 +957,7 @@ with st.sidebar:
 
     uploaded_files = st.file_uploader(
         "Upload files or bulk-select a folder",
-        type=["csv", "xlsx", "xls", "txt", "dat", "tsv"],
+        type=["csv", "xlsx", "xls", "txt", "dat", "tsv", "zip"],
         accept_multiple_files=True,
         label_visibility="collapsed",
         help=(
@@ -962,7 +966,7 @@ with st.sidebar:
         ),
     )
 
-    st.caption("CSV, Excel, TXT, DAT, and TSV supported. For folder imports, select all files in the folder at once.")
+    st.caption("CSV, Excel, TXT, DAT, TSV, and ZIP folders are supported.")
 
     st.divider()
 
@@ -1012,38 +1016,6 @@ with st.sidebar:
         format="%.4f",
     )
 
-    st.divider()
-    st.caption("Local AI")
-
-    ollama_url = st.text_input(
-        "Ollama server",
-        value="http://localhost:11434",
-        help="Keep this on localhost to run the model on this computer.",
-    )
-
-    installed_models, ollama_connection_error = list_ollama_models(ollama_url)
-
-    if installed_models:
-        preferred_model = next(
-            (name for name in installed_models if name.startswith("qwen3.5:4b")),
-            installed_models[0],
-        )
-        ai_model = st.selectbox(
-            "Local model",
-            options=installed_models,
-            index=installed_models.index(preferred_model),
-        )
-        st.success(f"Ollama connected · {len(installed_models)} model(s)")
-    else:
-        ai_model = st.text_input("Local model", value="qwen3.5:4b")
-        st.caption("Ollama is not connected yet. The analysis dashboard still works normally.")
-
-    if st.button("Refresh local models", use_container_width=True):
-        list_ollama_models.clear()
-        st.rerun()
-
-    if "cloud" in ai_model.lower():
-        st.warning("This model name appears to use Ollama Cloud, so it is not fully local.")
 
 
 st.markdown(
@@ -1058,9 +1030,15 @@ raw_frames = {}
 if uploaded_files:
     used_names = {}
 
-    for uploaded in uploaded_files:
+    try:
+        uploaded_payloads = list(iter_uploaded_payloads(uploaded_files))
+    except Exception as exc:
+        uploaded_payloads = []
+        st.error(f"Could not open uploaded files: {exc}")
+
+    for filename, data in uploaded_payloads:
         try:
-            base = safe_name(uploaded.name)
+            base = safe_name(filename)
 
             if base in used_names:
                 used_names[base] += 1
@@ -1069,10 +1047,10 @@ if uploaded_files:
                 used_names[base] = 1
                 display_name = base
 
-            raw_frames[display_name] = read_uploaded_file(uploaded)
+            raw_frames[display_name] = read_file_bytes(filename, data)
 
         except Exception as exc:
-            st.error(f"Could not read {uploaded.name}: {exc}")
+            st.error(f"Could not read {filename}: {exc}")
 
 else:
     st.info("Upload files to analyze your own data. Showing dummy example data for layout preview.")
@@ -1150,7 +1128,8 @@ for t in selected_tests:
     metrics.append(m)
 
 metrics_df = pd.DataFrame(metrics)
-replicate_summary_df = summarize_by_sample(metrics_df)
+replicate_records_df = build_replicate_records(selected_tests, metrics_df)
+replicate_summary_df = summarize_by_sample(replicate_records_df)
 
 mean_modulus = metrics_df["Young's Modulus (MPa)"].mean() if not metrics_df.empty else np.nan
 max_stress = metrics_df["Peak Stress (MPa)"].max() if not metrics_df.empty else np.nan
@@ -1200,6 +1179,7 @@ if not metrics_df.empty:
             "File",
             "Sample",
             "Repetition",
+            "Maximum Load (N)",
             "Peak Stress (MPa)",
             "Strain at Peak",
             "Young's Modulus (MPa)",
@@ -1211,6 +1191,7 @@ if not metrics_df.empty:
     ].copy()
 
     for col in [
+        "Maximum Load (N)",
         "Peak Stress (MPa)",
         "Strain at Peak",
         "Young's Modulus (MPa)",
@@ -1247,18 +1228,21 @@ if not metrics_df.empty:
 st.markdown('<div class="section-title">Sample Averages and Standard Deviations</div>', unsafe_allow_html=True)
 
 st.caption(
-    "Replicates are grouped from filenames ending in a repetition number, such as Sample X - 1, Sample X - 2, or SampleX-1."
+    "Results-table rows and filenames ending in repetition numbers are grouped by sample. Means and sample standard deviations are recalculated from the individual repetitions."
 )
 
 if not replicate_summary_df.empty:
     replicate_display = replicate_summary_df.copy()
-    for col in replicate_display.columns:
-        if col not in ["Sample", "Repetitions"]:
-            replicate_display[col] = pd.to_numeric(replicate_display[col], errors="ignore")
-        if pd.api.types.is_numeric_dtype(replicate_display[col]):
-            replicate_display[col] = replicate_display[col].round(5)
+    numeric_columns = replicate_display.select_dtypes(include=[np.number]).columns
+    replicate_display[numeric_columns] = replicate_display[numeric_columns].round(5)
 
     st.dataframe(replicate_display, use_container_width=True, hide_index=True)
+
+    with st.expander("Repetition-level values", expanded=False):
+        replicate_records_display = replicate_records_df.copy()
+        numeric_columns = replicate_records_display.select_dtypes(include=[np.number]).columns
+        replicate_records_display[numeric_columns] = replicate_records_display[numeric_columns].round(5)
+        st.dataframe(replicate_records_display, use_container_width=True, hide_index=True)
 
     replicate_csv = replicate_summary_df.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -1268,103 +1252,6 @@ if not replicate_summary_df.empty:
         "text/csv",
         use_container_width=True,
     )
-
-
-st.markdown('<div class="section-title">Local AI Review</div>', unsafe_allow_html=True)
-
-st.caption(
-    "The app sends a compact metric summary, diagnostics, and representative curve points "
-    "to the configured Ollama server. With localhost and a non-cloud model, processing stays on this computer."
-)
-
-ai_context = build_local_ai_context(
-    metrics_df,
-    selected_tests,
-    {
-        "smoothing": smoothing,
-        "smoothing_window": smooth_window,
-        "remove_spike_outliers": remove_outliers,
-        "crop_after_confirmed_failure": crop_failure,
-        "modulus_fit_start_strain": modulus_min,
-        "modulus_fit_end_strain": modulus_max,
-    },
-)
-
-review_tab, question_tab = st.tabs(["Automatic review", "Ask the data"])
-
-with review_tab:
-    st.write(
-        "Generate a file-by-file review of material-property results, fit quality, anomalies, and next checks."
-    )
-
-    review_disabled = not bool(selected_tests) or not bool(ai_model.strip())
-
-    if st.button(
-        "Generate local AI review",
-        type="primary",
-        use_container_width=True,
-        disabled=review_disabled,
-    ):
-        try:
-            with st.spinner(f"Running {ai_model} locally..."):
-                st.session_state.local_ai_review = run_local_ai_review(
-                    ollama_url,
-                    ai_model,
-                    ai_context,
-                    """
-Review these selected mechanical-test files. Return:
-1. A three-bullet executive summary.
-2. File-by-file findings using the supplied values and units.
-3. Data-quality or modulus-fit concerns.
-4. Supported comparisons between files.
-5. Specific next checks before the results are used in a report.
-Do not repeat the raw JSON.
-""".strip(),
-                )
-        except Exception as exc:
-            st.error(str(exc))
-
-    if st.session_state.get("local_ai_review"):
-        st.markdown(st.session_state.local_ai_review)
-
-with question_tab:
-    ai_question = st.text_area(
-        "Question",
-        placeholder=(
-            "Examples: Which file has the strongest supported result? "
-            "Why is the modulus fit weak? What should I inspect next?"
-        ),
-        height=100,
-    )
-
-    if st.button(
-        "Ask local AI",
-        use_container_width=True,
-        disabled=not bool(ai_question.strip()) or not bool(selected_tests),
-    ):
-        try:
-            with st.spinner(f"Asking {ai_model} locally..."):
-                answer = run_local_ai_review(
-                    ollama_url,
-                    ai_model,
-                    ai_context,
-                    (
-                        "Answer the researcher's question using only the supplied dashboard context. "
-                        "Quote the relevant numeric evidence and state limitations.\n\n"
-                        f"Question: {ai_question.strip()}"
-                    ),
-                )
-
-            history = st.session_state.setdefault("local_ai_history", [])
-            history.append({"question": ai_question.strip(), "answer": answer})
-            st.session_state.local_ai_history = history[-6:]
-        except Exception as exc:
-            st.error(str(exc))
-
-    for item in reversed(st.session_state.get("local_ai_history", [])):
-        with st.container(border=True):
-            st.markdown(f"**Question:** {item['question']}")
-            st.markdown(item["answer"])
 
 
 with st.expander("Cleaning notes", expanded=False):
