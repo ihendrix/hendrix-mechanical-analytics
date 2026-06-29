@@ -182,6 +182,8 @@ def build_local_ai_context(metrics_df, selected_tests, settings):
         metric_records.append(
             {
                 "file": row.get("File"),
+                "sample": row.get("Sample"),
+                "repetition": _rounded_or_none(row.get("Repetition"), 0),
                 "data_type": row.get("Data Type"),
                 "peak_stress_mpa": _rounded_or_none(row.get("Peak Stress (MPa)")),
                 "strain_at_peak": _rounded_or_none(row.get("Strain at Peak")),
@@ -275,6 +277,59 @@ def safe_name(filename: str) -> str:
 
 def display_name_from_index(index: int) -> str:
     return f"Specimen {index}"
+
+
+def parse_sample_repetition(name: str):
+    """Split names like SampleX-1 / Sample X - 1 into sample and replicate."""
+    base = Path(str(name)).stem.strip()
+    base = re.sub(r"\s+", " ", base)
+
+    match = re.match(r"^(.*?)[_\s-]+(-?\d+)$", base)
+    if match:
+        sample = match.group(1).strip(" _-") or base
+        rep = int(match.group(2))
+        return sample, rep
+
+    # Handles names where the final repetition is attached directly, e.g. X1.
+    match = re.match(r"^(.*?)(-\d+|\d+)$", base)
+    if match and len(match.group(1).strip()) >= 1:
+        sample = match.group(1).strip(" _-") or base
+        rep = int(match.group(2))
+        return sample, rep
+
+    return base, np.nan
+
+
+def summarize_by_sample(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    """Average replicate files by parsed sample name and report standard deviations."""
+    if metrics_df.empty:
+        return pd.DataFrame()
+
+    df = metrics_df.copy()
+    parsed = df["File"].apply(parse_sample_repetition)
+    df["Sample"] = parsed.apply(lambda x: x[0])
+    df["Repetition"] = parsed.apply(lambda x: x[1])
+
+    numeric_cols = [
+        "Peak Stress (MPa)",
+        "Strain at Peak",
+        "Young's Modulus (MPa)",
+        "Modulus R²",
+        "Area Under Curve",
+    ]
+
+    grouped = df.groupby("Sample", dropna=False)
+    summary = grouped[numeric_cols].agg(["mean", "std"])
+    summary.columns = [f"{metric} {stat.title()}" for metric, stat in summary.columns]
+    summary = summary.reset_index()
+
+    summary.insert(1, "Replicates", grouped.size().values)
+    rep_values = grouped["Repetition"].apply(
+        lambda s: ", ".join(str(int(v)) for v in sorted(s.dropna().unique()))
+    ).reset_index(drop=True)
+    summary.insert(2, "Repetitions", rep_values)
+
+    return summary
 
 
 def example_data() -> dict[str, pd.DataFrame]:
@@ -897,13 +952,17 @@ with st.sidebar:
     st.header("Controls")
 
     uploaded_files = st.file_uploader(
-        "Upload files",
+        "Upload files or bulk-select a folder",
         type=["csv", "xlsx", "xls", "txt", "dat", "tsv"],
         accept_multiple_files=True,
         label_visibility="collapsed",
+        help=(
+            "To import a folder, open the folder in your file picker, select all supported files, "
+            "and upload them together. Streamlit receives them as one batch."
+        ),
     )
 
-    st.caption("CSV, Excel, TXT, DAT, and TSV supported.")
+    st.caption("CSV, Excel, TXT, DAT, and TSV supported. For folder imports, select all files in the folder at once.")
 
     st.divider()
 
@@ -1077,9 +1136,12 @@ metrics = []
 
 for t in selected_tests:
     m = calculate_metrics(t.clean, modulus_min, modulus_max, t.data_kind)
+    sample_name, repetition = parse_sample_repetition(t.name)
     m.update(
         {
             "File": t.name,
+            "Sample": sample_name,
+            "Repetition": repetition,
             "Detected Strain Column": t.strain_col,
             "Detected Stress Column": t.stress_col,
             "Data Type": t.data_kind.title(),
@@ -1088,6 +1150,7 @@ for t in selected_tests:
     metrics.append(m)
 
 metrics_df = pd.DataFrame(metrics)
+replicate_summary_df = summarize_by_sample(metrics_df)
 
 mean_modulus = metrics_df["Young's Modulus (MPa)"].mean() if not metrics_df.empty else np.nan
 max_stress = metrics_df["Peak Stress (MPa)"].max() if not metrics_df.empty else np.nan
@@ -1135,6 +1198,8 @@ if not metrics_df.empty:
     display = metrics_df[
         [
             "File",
+            "Sample",
+            "Repetition",
             "Peak Stress (MPa)",
             "Strain at Peak",
             "Young's Modulus (MPa)",
@@ -1177,6 +1242,32 @@ if not metrics_df.empty:
     bar.update_yaxes(gridcolor="rgba(255,255,255,.07)")
 
     st.plotly_chart(bar, use_container_width=True)
+
+
+st.markdown('<div class="section-title">Sample Averages and Standard Deviations</div>', unsafe_allow_html=True)
+
+st.caption(
+    "Replicates are grouped from filenames ending in a repetition number, such as Sample X - 1, Sample X - 2, or SampleX-1."
+)
+
+if not replicate_summary_df.empty:
+    replicate_display = replicate_summary_df.copy()
+    for col in replicate_display.columns:
+        if col not in ["Sample", "Repetitions"]:
+            replicate_display[col] = pd.to_numeric(replicate_display[col], errors="ignore")
+        if pd.api.types.is_numeric_dtype(replicate_display[col]):
+            replicate_display[col] = replicate_display[col].round(5)
+
+    st.dataframe(replicate_display, use_container_width=True, hide_index=True)
+
+    replicate_csv = replicate_summary_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download replicate averages CSV",
+        replicate_csv,
+        "mechanical_replicate_summary.csv",
+        "text/csv",
+        use_container_width=True,
+    )
 
 
 st.markdown('<div class="section-title">Local AI Review</div>', unsafe_allow_html=True)
@@ -1291,9 +1382,10 @@ with st.expander("Cleaned data preview + downloads", expanded=False):
 
     cleaned_csv = all_clean.to_csv(index=False).encode("utf-8") if not all_clean.empty else b""
     summary_csv = metrics_df.to_csv(index=False).encode("utf-8") if not metrics_df.empty else b""
+    replicate_csv = replicate_summary_df.to_csv(index=False).encode("utf-8") if not replicate_summary_df.empty else b""
     chart_html = fig.to_html(include_plotlyjs="cdn") if not all_clean.empty else ""
 
-    a, b, c = st.columns(3)
+    a, b, c, d = st.columns(4)
 
     with a:
         st.download_button(
@@ -1314,6 +1406,15 @@ with st.expander("Cleaned data preview + downloads", expanded=False):
         )
 
     with c:
+        st.download_button(
+            "Download replicate CSV",
+            replicate_csv,
+            "mechanical_replicate_summary.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+
+    with d:
         st.download_button(
             "Download chart HTML",
             chart_html,
