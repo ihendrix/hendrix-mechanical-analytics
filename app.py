@@ -207,70 +207,6 @@ def summarize_by_sample(replicate_records: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
-def build_individual_sample_csv(
-    replicate_records: pd.DataFrame,
-    sample_name: str,
-) -> bytes:
-    """Create a CSV containing one sample's repetitions, mean, and standard deviation."""
-    sample_rows = replicate_records[
-        replicate_records["Sample"].astype(str) == str(sample_name)
-    ].copy()
-
-    if sample_rows.empty:
-        return b""
-
-    numeric_cols = [
-        col
-        for col in [
-            "Maximum Load (N)",
-            "Peak Stress (MPa)",
-            "Strain at Peak",
-            "Young's Modulus (MPa)",
-            "Modulus R²",
-            "Area Under Curve",
-        ]
-        if col in sample_rows.columns
-    ]
-
-    for col in numeric_cols:
-        sample_rows[col] = pd.to_numeric(sample_rows[col], errors="coerce")
-
-    sample_rows.insert(0, "Row Type", "Repetition")
-
-    mean_row = {
-        "Row Type": "Mean",
-        "File": "",
-        "Sample": sample_name,
-        "Repetition": "",
-    }
-    std_row = {
-        "Row Type": "Standard Deviation",
-        "File": "",
-        "Sample": sample_name,
-        "Repetition": "",
-    }
-
-    for col in numeric_cols:
-        mean_row[col] = sample_rows[col].mean()
-        std_row[col] = sample_rows[col].std(ddof=1)
-
-    output = pd.concat(
-        [
-            sample_rows,
-            pd.DataFrame([mean_row, std_row], columns=sample_rows.columns),
-        ],
-        ignore_index=True,
-    )
-
-    return output.to_csv(index=False).encode("utf-8")
-
-
-def safe_download_filename(name: str) -> str:
-    """Return a filesystem-safe filename stem for downloads."""
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("._-")
-    return cleaned or "sample"
-
-
 def example_data() -> dict[str, pd.DataFrame]:
     rng = np.random.default_rng(11)
     output = {}
@@ -1309,40 +1245,13 @@ if not replicate_summary_df.empty:
         st.dataframe(replicate_records_display, use_container_width=True, hide_index=True)
 
     replicate_csv = replicate_summary_df.to_csv(index=False).encode("utf-8")
-
-    download_col_1, download_col_2 = st.columns(2)
-
-    with download_col_1:
-        st.download_button(
-            "Download replicate averages CSV",
-            replicate_csv,
-            "mechanical_replicate_summary.csv",
-            "text/csv",
-            use_container_width=True,
-        )
-
-    with download_col_2:
-        available_samples = replicate_summary_df["Sample"].astype(str).tolist()
-        selected_sample_download = st.selectbox(
-            "Sample to download",
-            options=available_samples,
-            key="individual_sample_download",
-            label_visibility="collapsed",
-        )
-
-        individual_sample_csv = build_individual_sample_csv(
-            replicate_records_df,
-            selected_sample_download,
-        )
-
-        st.download_button(
-            "Download selected sample CSV",
-            individual_sample_csv,
-            f"{safe_download_filename(selected_sample_download)}_results.csv",
-            "text/csv",
-            use_container_width=True,
-            disabled=not bool(individual_sample_csv),
-        )
+    st.download_button(
+        "Download replicate averages CSV",
+        replicate_csv,
+        "mechanical_replicate_summary.csv",
+        "text/csv",
+        use_container_width=True,
+    )
 
 
 with st.expander("Cleaning notes", expanded=False):
